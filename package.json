@@ -1,0 +1,11 @@
+{
+  "name": "zalando-deals-scraper",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "scrape": "node scraper.js"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
