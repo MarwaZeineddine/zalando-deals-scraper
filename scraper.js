@@ -7,7 +7,9 @@ const ENRICH_SIZES = false;            // turn off if you want faster runs
 const ENRICH_MAX_PER_CATEGORY = 25;   // ✅ limit product-page visits per category
 
 const CATEGORY_URLS = [
-  "https://www.zalando.it/promo-scarpe-uomo/?order=sale"
+  "https://www.zalando.it/occhiali-sole-donna/?order=sale",
+  "https://www.zalando.it/scarpe-donna/?order=sale"
+
 ];
 
 const MAX_ITEMS_PER_CATEGORY = 80;
@@ -305,13 +307,20 @@ async function extractCardData(card, baseUrl, context, allowEnrich) {
     .$eval("img", (el) => el.getAttribute("src") || el.getAttribute("data-src"))
     .catch(() => null);
 
-  const title =
-    safeText(await card.$eval('[data-testid="product-card__title"]', (el) => el.textContent).catch(() => "")) ||
-    safeText(await card.$eval("img[alt]", (el) => el.getAttribute("alt")).catch(() => "")) ||
-    safeText(await card.$eval("h3", (el) => el.textContent).catch(() => ""));
+const title =
+  safeText(await card.$eval('[data-testid="product-card__title"]', el => el.textContent).catch(() => "")) ||
+  safeText(await card.$eval('header h3 span:nth-child(2)', el => el.textContent).catch(() => "")) ||
+  safeText(await card.$eval('h3 span:nth-child(2)', el => el.textContent).catch(() => "")) ||
+  safeText(await card.$eval("img[alt]", el => el.getAttribute("alt")).catch(() => "")) ||
+  safeText(await card.$eval("h3", el => el.textContent).catch(() => ""));
 
-  const brand =
-    safeText(await card.$eval('[data-testid="product-card__brand"]', (el) => el.textContent).catch(() => "")) || "";
+
+// ✅ BRAND from listing card DOM (Zalando puts it in the first span inside h3)
+const brand =
+  safeText(await card.$eval('header h3 span:first-child', el => el.textContent).catch(() => "")) ||
+  safeText(await card.$eval('h3 span:first-child', el => el.textContent).catch(() => "")) ||
+  safeText(await card.$eval('a[href*="/brand/"]', el => el.textContent).catch(() => "")) ||
+  "";
 
   const { price_sale, price_original } = await extractPricesFromCard(card);
   if (!title || !product_url || !price_sale) return null;
