@@ -1,9 +1,13 @@
 import { chromium } from "playwright";
 import fs from "fs";
 
+const MIN_DISCOUNT_PERCENT = 35;
+const MIN_SALE_PRICE = 10;            // ✅ prevents weird tiny numbers slipping through
+const ENRICH_SIZES = false;            // turn off if you want faster runs
+const ENRICH_MAX_PER_CATEGORY = 25;   // ✅ limit product-page visits per category
+
 const CATEGORY_URLS = [
-  "https://www.zalando.it/promo-sneakers-uomo/"
-  
+  "https://www.zalando.it/promo-scarpe-uomo/?order=sale"
 ];
 
 const MAX_ITEMS_PER_CATEGORY = 80;
@@ -13,11 +17,11 @@ function safeText(s) {
   return (s || "").replace(/\s+/g, " ").trim();
 }
 
-// Parse "€107,99" / "107,99" / "1.234,56" etc
+// Parse "107,99" / "1.234,56" / "107.99" / "1,234.56"
 function parseMoney(text) {
   if (!text) return null;
 
-  const m = text.match(/(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})/);
+  const m = String(text).match(/(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})/);
   if (!m) return null;
 
   let t = m[1];
@@ -65,7 +69,7 @@ async function acceptCookies(page) {
       const btn = page.locator(sel);
       if (await btn.count()) {
         await btn.first().click({ timeout: 5000 }).catch(() => {});
-        await page.waitForTimeout(1000);
+        await page.waitForTimeout(800);
         return true;
       }
     }
@@ -74,6 +78,125 @@ async function acceptCookies(page) {
     return false;
   }
 }
+
+async function fetchBrandAndSizes(context, productUrl) {
+  const p = await context.newPage();
+
+  try {
+    await p.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+    await acceptCookies(p);
+    await p.waitForTimeout(1200);
+
+    // --- BRAND (stable-ish selectors) ---
+    const brand =
+      safeText(await p.locator('[data-testid="product-header-brand"]').first().textContent().catch(() => "")) ||
+      safeText(await p.locator('[data-testid="product-header__brand"]').first().textContent().catch(() => "")) ||
+      safeText(await p.locator('a[href*="/brand/"]').first().textContent().catch(() => "")) ||
+      safeText(await p.locator('meta[property="product:brand"]').getAttribute("content").catch(() => "")) ||
+      "";
+
+    // --- OPEN SIZE DROPDOWN ---
+    const openers = [
+      // English
+      'button:has-text("Choose your size")',
+      'button:has-text("Select size")',
+      // Italian
+      'button:has-text("Seleziona la taglia")',
+      'button:has-text("Scegli la taglia")',
+      'button:has-text("Seleziona misura")',
+      // fallback by aria-label
+      'button[aria-label*="taglia" i]',
+      'button[aria-label*="size" i]',
+    ];
+
+    for (const sel of openers) {
+      const btn = p.locator(sel).first();
+      if (await btn.count().catch(() => 0)) {
+        await btn.click({ timeout: 4000 }).catch(() => {});
+        await p.waitForTimeout(800);
+        break;
+      }
+    }
+
+    // --- WAIT FOR SIZE LIST PANEL ---
+    // Zalando often shows options as list items / buttons within a dropdown panel
+    const panelCandidates = [
+      '[role="listbox"]',
+      '[data-testid*="size" i]',
+      'div:has-text("EU size")',
+      'div:has-text("Manufacturer sizes")',
+      'div:has-text("Taglie")',
+    ];
+
+    let panelFound = false;
+    for (const sel of panelCandidates) {
+      const loc = p.locator(sel).first();
+      const ok = await loc.waitFor({ timeout: 6000 }).then(() => true).catch(() => false);
+      if (ok) { panelFound = true; break; }
+    }
+
+    if (!panelFound) {
+      // If no panel is visible, sizes might be unavailable
+      return { brand, available_sizes: [] };
+    }
+
+    // --- EXTRACT SIZES FROM OPENED DROPDOWN ---
+    // We grab text from common clickable rows (buttons / list items)
+    const sizes = await p.evaluate(() => {
+      const out = new Set();
+
+      // collect clickable rows in listbox or dropdown containers
+      const containers = Array.from(document.querySelectorAll('[role="listbox"], [data-testid*="size" i]'));
+      const scope = containers.length ? containers : [document];
+
+      const sizeRegex =
+        /^(EU|IT|US|UK)?\s*\d+(\s*\/\s*\d+)?(\.\d+)?$/i; // supports "37 1/3", "36", "35.5"
+
+      for (const root of scope) {
+        const nodes = root.querySelectorAll('button, [role="option"], li, div');
+        for (const n of nodes) {
+          const txt = (n.textContent || "").replace(/\s+/g, " ").trim();
+
+          // Skip disabled / not available
+          const ariaDisabled = n.getAttribute?.("aria-disabled");
+          const disabled = (n instanceof HTMLButtonElement && n.disabled) || ariaDisabled === "true";
+          if (disabled) continue;
+
+          // Most rows look like: "35.5 | 3 €53.95" so we take only the first token before | or €
+          const firstChunk = txt.split("|")[0].trim().split("€")[0].trim();
+
+          // Extract the EU-like number part from that chunk
+          // e.g. "36 2/3" "37 1/3" "35.5"
+          const cleaned = firstChunk
+            .replace(/(EU|IT|US|UK)\s*/i, "")
+            .trim();
+
+          if (sizeRegex.test(cleaned)) out.add(cleaned);
+        }
+      }
+
+      return Array.from(out);
+    });
+
+    // sort sizes numerically when possible
+    const sorted = sizes
+      .map(s => String(s))
+      .filter(Boolean)
+      .sort((a, b) => {
+        const na = parseFloat(a.replace(/\s*\/\s*/g, "."));
+        const nb = parseFloat(b.replace(/\s*\/\s*/g, "."));
+        if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+        return a.localeCompare(b);
+      });
+
+    return { brand, available_sizes: sorted };
+  } catch {
+    return { brand: "", available_sizes: [] };
+  } finally {
+    await p.close().catch(() => {});
+  }
+}
+
 
 async function gotoWithRetry(page, url, tries = 3) {
   let lastErr;
@@ -132,36 +255,34 @@ async function scrollToLoad(page, targetCount) {
 }
 
 /**
- * ✅ PRICE EXTRACTION THAT AVOIDS UNIT PRICES مثل:
- * "€0,29 / 100 g" , "€1,99 / 100 ml" , "€/kg" ...
+ * ✅ PRICE extraction:
+ * Only parse lines containing € AND ignore unit-price patterns like:
+ * "€0,29 / 100 g", "€1,99 / 100 ml", "€/kg", "€/l"
  */
 async function extractPricesFromCard(card) {
   const text = await card.textContent().catch(() => "");
   if (!text) return { price_original: null, price_sale: null };
 
-  // Keep only lines with €
   const euroLines = text
     .split("\n")
     .map((s) => s.trim())
-    .filter((s) => s.includes("€"));
+    .filter((s) => /€/.test(s));
 
-  // Remove unit-price lines
   const filtered = euroLines.filter((line) => {
     const lower = line.toLowerCase();
 
-    // If it contains "/ 100", "/100", "€/kg", "€/l", "per 100", etc => unit price
-    if (lower.includes("/")) return false;
-    if (/\b(100)\b/.test(lower) && /\b(ml|g|kg|l)\b/.test(lower)) return false;
-    if (/\b(ml|g|kg|l)\b/.test(lower) && lower.includes("€")) {
-      // many unit prices include both € and units
-      return false;
-    }
+    // unit price patterns
+    if (/(€\s*\/)|(\/\s*€)/.test(lower)) return false;
+    if (/\/\s*\d+\s*(ml|g|kg|l)\b/.test(lower)) return false;
+    if (/\bper\s*\d+\s*(ml|g|kg|l)\b/.test(lower)) return false;
+    if (/\b(\d+)\s*(ml|g|kg|l)\b/.test(lower) && lower.includes("/")) return false;
+
     return true;
   });
 
-  // Extract all price numbers from remaining lines
   const prices = [];
   for (const line of filtered) {
+    // extract all prices in the line
     const matches = line.match(/(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})/g) || [];
     for (const raw of matches) {
       const val = parseMoney(raw);
@@ -169,17 +290,14 @@ async function extractPricesFromCard(card) {
     }
   }
 
-  const uniq = Array.from(new Set(prices));
-  uniq.sort((a, b) => a - b); // ascending
-
+  const uniq = Array.from(new Set(prices)).sort((a, b) => a - b);
   if (uniq.length === 0) return { price_original: null, price_sale: null };
   if (uniq.length === 1) return { price_original: null, price_sale: uniq[0] };
 
-  // lowest = sale, highest = original
   return { price_original: uniq[uniq.length - 1], price_sale: uniq[0] };
 }
 
-async function extractCardData(card, baseUrl) {
+async function extractCardData(card, baseUrl, context, allowEnrich) {
   const href = await card.$eval('a[href*="/"]', (a) => a.getAttribute("href")).catch(() => null);
   const product_url = href ? new URL(href, baseUrl).toString() : null;
 
@@ -196,16 +314,35 @@ async function extractCardData(card, baseUrl) {
     safeText(await card.$eval('[data-testid="product-card__brand"]', (el) => el.textContent).catch(() => "")) || "";
 
   const { price_sale, price_original } = await extractPricesFromCard(card);
-  const discount_percent = computeDiscount(price_original, price_sale);
-
   if (!title || !product_url || !price_sale) return null;
+
+  // price sanity
+  if (price_sale < MIN_SALE_PRICE) return null;
+
+  // discount
+  let discount_percent = 0;
+  if (price_original && price_sale && price_original > price_sale) {
+    discount_percent = computeDiscount(price_original, price_sale);
+  }
+  if (discount_percent < MIN_DISCOUNT_PERCENT) return null;
+
+  // enrichment
+  let brand_final = brand;
+  let available_sizes = [];
+
+  if (ENRICH_SIZES && allowEnrich && context && product_url) {
+    const extra = await fetchBrandAndSizes(context, product_url);
+    if (extra.brand) brand_final = extra.brand;
+    available_sizes = extra.available_sizes || [];
+  }
 
   const id = product_url.split("?")[0];
 
   return {
     id,
     title,
-    brand,
+    brand: brand_final,
+    // available_sizes,
     price_sale,
     price_original,
     discount_percent,
@@ -216,7 +353,7 @@ async function extractCardData(card, baseUrl) {
   };
 }
 
-async function scrapeCategory(page, url, maxCards = MAX_ITEMS_PER_CATEGORY) {
+async function scrapeCategory(page, url, context, maxCards = MAX_ITEMS_PER_CATEGORY) {
   console.log("➡️ Opening:", url);
 
   try {
@@ -250,9 +387,16 @@ async function scrapeCategory(page, url, maxCards = MAX_ITEMS_PER_CATEGORY) {
   if (cards.length === 0) cards = await page.$$('li:has(a[href*="/"])');
 
   const results = [];
+  let enrichedCount = 0;
+
   for (const card of cards.slice(0, maxCards)) {
-    const item = await extractCardData(card, url);
-    if (item) results.push(item);
+    const allowEnrich = enrichedCount < ENRICH_MAX_PER_CATEGORY;
+    const item = await extractCardData(card, url, context, allowEnrich);
+
+    if (item) {
+      results.push(item);
+      if (ENRICH_SIZES && allowEnrich) enrichedCount += 1;
+    }
   }
 
   if (results.length === 0) {
@@ -260,7 +404,7 @@ async function scrapeCategory(page, url, maxCards = MAX_ITEMS_PER_CATEGORY) {
     await debugDump(page, "debug-empty");
   }
 
-  console.log(`✅ ${url} → ${results.length} items`);
+  console.log(`✅ ${url} → ${results.length} items (enriched: ${Math.min(enrichedCount, ENRICH_MAX_PER_CATEGORY)})`);
   return results;
 }
 
@@ -285,7 +429,7 @@ async function main() {
   const all = [];
   for (const url of CATEGORY_URLS) {
     try {
-      const items = await scrapeCategory(page, url, MAX_ITEMS_PER_CATEGORY);
+      const items = await scrapeCategory(page, url, context, MAX_ITEMS_PER_CATEGORY);
       all.push(...items);
     } catch (e) {
       console.error("❌ Failed category:", url, e?.message || e);
@@ -294,6 +438,7 @@ async function main() {
 
   await browser.close();
 
+  // Deduplicate
   const map = new Map();
   for (const p of all) if (!map.has(p.id)) map.set(p.id, p);
   const unique = Array.from(map.values());
